@@ -23,7 +23,9 @@ import           Graphics.Vty.Attributes    (defAttr)
 import           Lens.Micro
 import           Lens.Micro.TH
 
+import qualified Brick.Widgets.List         as BrickL
 import qualified Data.Text                  as T
+import qualified Data.Vector                as Vec
 import qualified Graphics.Vty               as Vty
 
 type ResourceName = Text
@@ -31,8 +33,8 @@ type ResourceName = Text
 -- | The state we want to maintain
 data AppState
   = AppState
-  { _asClientMessages :: ![(UTCTime, Text)]
-  , _asServerMessages :: ![(UTCTime, Text)]
+  { _asClientMessages :: !(BrickL.List ResourceName (UTCTime, Text))
+  , _asServerMessages :: !(BrickL.List ResourceName (UTCTime, Text))
   , _asMessageEditor  :: !(Editor Text ResourceName)
   } deriving (Show)
 
@@ -44,11 +46,11 @@ data WIEvent
   | WIENewClientMsg !Text !UTCTime
   deriving (Show)
 
-drawMessageBox :: Text -> [(UTCTime, Text)] -> Widget ResourceName
+drawMessageBox :: Text -> BrickL.List ResourceName (UTCTime, Text) -> Widget ResourceName
 drawMessageBox label msgs =
-  borderWithLabel (txt label) $ padAll 1 $ vBoxFill $ (map renderMsg $ reverse msgs)
+  borderWithLabel (txt label) $ BrickL.renderList renderMsg False msgs
   where
-    renderMsg (time, msg) = txtWrap $ "[" <> (T.pack $ show time) <> "] " <> msg
+    renderMsg _selected (time, msg) = txtWrap $ "[" <> (T.pack $ show time) <> "] " <> msg
     vBoxFill ws = vBox $ ws <> [fill ' ']
 
 drawReadingBox :: AppState -> Widget ResourceName
@@ -73,30 +75,38 @@ handleEvent :: BChan Text -> AppState -> BrickEvent ResourceName WIEvent -> Even
 handleEvent clientChan state@AppState{..} ev = case ev of
   -- handle custom events
   AppEvent aev -> case aev of
-    WIENewClientMsg m t -> continue $ state { _asClientMessages = _asClientMessages ++ [(t, m)] }
-    -- cap the no of server messages kept in memory to be 50, because anyway so many won't be visible
-    WIENewServerMsg m t -> let newList = if length _asServerMessages > 50
-                                         then (tail _asServerMessages) ++ [(t, m)]
-                                         else _asServerMessages ++ [(t, m)]
-                               newState = state { _asServerMessages = newList }
-                           in continue newState
+    WIENewClientMsg m t -> let newList = insertNewMessage (t,m) _asClientMessages
+                           in continue $ state { _asClientMessages = newList }
+    WIENewServerMsg m t -> let newList = insertNewMessage (t,m) _asServerMessages
+                           in continue $ state { _asServerMessages = newList }
   -- handle Vty key events
   VtyEvent vev -> case vev of
     Vty.EvKey Vty.KEsc []   -> halt state
-    Vty.EvKey Vty.KEnter [] -> handleEnter
-    _                       -> handleEventLensed state asMessageEditor handleEditorEvent vev >>= continue
+    Vty.EvKey Vty.KEnter [] -> handleEnter state clientChan
+    _                       -> handleEventLensed state asMessageEditor handleEditorEvent vev
+                               >>= \st -> handleEventLensed st asClientMessages BrickL.handleListEvent vev
+                               >>= \st -> handleEventLensed st asServerMessages BrickL.handleListEvent vev
+                               >>= continue
   _            -> continue state
 
-  where
-    handleEnter = do
-      let contents = T.unlines $ getEditContents $ state ^. asMessageEditor
-          newState = state & asMessageEditor .~ (resetEdit state)
-      if T.null $ T.strip contents
-        then continue state
-        else do
-        liftIO $ writeBChan clientChan contents
-        continue newState
+insertNewMessage
+  :: a
+  -> BrickL.GenericList n Vec.Vector a
+  -> BrickL.GenericList n Vec.Vector a
+insertNewMessage elem msgList =
+ let pos = Vec.length $ msgList ^. BrickL.listElementsL
+ in BrickL.listMoveDown $ BrickL.listInsert pos elem msgList
 
+handleEnter :: AppState -> BChan Text -> EventM n (Next AppState)
+handleEnter state clientChan = do
+  let contents = T.unlines $ getEditContents $ state ^. asMessageEditor
+      newState = state & asMessageEditor .~ (resetEdit state)
+  if T.null $ T.strip contents
+    then continue state
+    else do
+    liftIO $ writeBChan clientChan contents
+    continue newState
+  where
     -- resetEdit :: AppState -> Editor Text ResourceName
     resetEdit st = applyEdit transformer $ state ^. asMessageEditor
     -- transformer :: TextZipper Text -> TextZipper Text
@@ -113,7 +123,9 @@ mkApp clientChan =
 
 runUI :: BChan WIEvent -> BChan Text -> IO ()
 runUI brickChan clientChan = do
-  let initialState = AppState [] [] (editor "edit-box" (Just 1) "")
+  let initialState = AppState clientList serverList (editor "edit-box" (Just 1) "")
+      clientList = BrickL.list "client-list" Vec.empty 1
+      serverList = BrickL.list "server-list" Vec.empty 1
       buildVty = Vty.mkVty Vty.defaultConfig
   initialVty <- buildVty
   void $ customMain initialVty buildVty (Just brickChan) (mkApp clientChan) initialState
