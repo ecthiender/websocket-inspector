@@ -3,6 +3,7 @@
 {-# LANGUAGE TemplateHaskell   #-}
 module Lib
   ( runUI
+  , WIEvent (..)
   ) where
 
 import           Brick
@@ -14,6 +15,7 @@ import           Brick.Widgets.Center
 import           Brick.Widgets.Edit
 import           Control.Concurrent         (forkIO, threadDelay)
 import           Control.Monad              (forever, void)
+import           Control.Monad.IO.Class
 import           Data.Text                  (Text)
 import           Data.Text.Zipper
 import           Data.Time.Clock
@@ -29,83 +31,89 @@ type ResourceName = Text
 -- | The state we want to maintain
 data AppState
   = AppState
-  { _asClientMessages    :: ![Text]
-  , _asServerMessages    :: ![Text]
-  , _asCurrentEditorText :: !(Editor Text ResourceName)
+  { _asClientMessages :: ![(UTCTime, Text)]
+  , _asServerMessages :: ![(UTCTime, Text)]
+  , _asMessageEditor  :: !(Editor Text ResourceName)
   } deriving (Show)
 
 makeLenses 'AppState
 
 -- | our custom event
 data WIEvent
-  = WIENewServerMsg !Text
-  | WIENewClientMsg !Text
+  = WIENewServerMsg !Text !UTCTime
+  | WIENewClientMsg !Text !UTCTime
   deriving (Show)
 
-drawMessageBox :: [Text] -> Widget ResourceName
-drawMessageBox msgs = padAll 2 $ vBox $ map txt msgs
+drawMessageBox :: Text -> [(UTCTime, Text)] -> Widget ResourceName
+drawMessageBox label msgs =
+  borderWithLabel (txt label) $ padAll 1 $ vBoxFill $ (map renderMsg $ reverse msgs)
+  where
+    renderMsg (time, msg) = txtWrap $ "[" <> (T.pack $ show time) <> "] " <> msg
+    vBoxFill ws = vBox $ ws <> [fill ' ']
 
 drawReadingBox :: AppState -> Widget ResourceName
 drawReadingBox (AppState clientMsgs serverMsgs _) =
-  withBorderStyle unicode $ border $
-  (center (drawMessageBox serverMsgs) <+> vBorder <+> center (drawMessageBox clientMsgs))
+  withBorderStyle unicode $
+  (    center (drawMessageBox "Messages from Server" serverMsgs)
+   <+> center (drawMessageBox "Messages sent by you (client)" clientMsgs)
+  )
 
 drawInputBox :: AppState -> Widget ResourceName
 drawInputBox state =
-  withBorderStyle unicode $ borderWithLabel (txt helpText) $
-  padAll 1 $ renderEditor (txt . T.unlines) True (state ^. asCurrentEditorText)
-  where
-    helpText = "Type and press enter to send messge to server.."
+  withBorderStyle unicode $ borderWithLabel (txt "Message Editor") $
+  txt "> " <+> renderEditor (txt . T.unlines) True (state ^. asMessageEditor)
+
+footerHelp :: Widget ResourceName
+footerHelp = txt "HELP: **ESC**: quit/exit | **ENTER**: Send message"
 
 drawUI :: AppState -> [Widget ResourceName]
-drawUI appState = [drawReadingBox appState <=> drawInputBox appState]
+drawUI appState = [drawReadingBox appState <=> drawInputBox appState <=> footerHelp]
 
-handleEvent :: AppState -> BrickEvent ResourceName WIEvent -> EventM ResourceName (Next AppState)
-handleEvent state@AppState{..} ev = case ev of
+handleEvent :: BChan Text -> AppState -> BrickEvent ResourceName WIEvent -> EventM ResourceName (Next AppState)
+handleEvent clientChan state@AppState{..} ev = case ev of
   -- handle custom events
   AppEvent aev -> case aev of
-    WIENewClientMsg m -> continue $ state { _asClientMessages = _asClientMessages ++ [m] }
-    WIENewServerMsg m -> continue $ state { _asServerMessages = _asServerMessages ++ [m] }
+    WIENewClientMsg m t -> continue $ state { _asClientMessages = _asClientMessages ++ [(t, m)] }
+    -- cap the no of server messages kept in memory to be 50, because anyway so many won't be visible
+    WIENewServerMsg m t -> let newList = if length _asServerMessages > 50
+                                         then (tail _asServerMessages) ++ [(t, m)]
+                                         else _asServerMessages ++ [(t, m)]
+                               newState = state { _asServerMessages = newList }
+                           in continue newState
   -- handle Vty key events
   VtyEvent vev -> case vev of
     Vty.EvKey Vty.KEsc []   -> halt state
     Vty.EvKey Vty.KEnter [] -> handleEnter
-    _                       -> handleEventLensed state asCurrentEditorText handleEditorEvent vev >>= continue
+    _                       -> handleEventLensed state asMessageEditor handleEditorEvent vev >>= continue
   _            -> continue state
 
   where
     handleEnter = do
-      let contents = getEditContents $ state ^. asCurrentEditorText
-          newState = state & asCurrentEditorText .~ (resetEdit state)
-      continue $ newState { _asClientMessages = _asClientMessages ++ contents }
+      let contents = T.unlines $ getEditContents $ state ^. asMessageEditor
+          newState = state & asMessageEditor .~ (resetEdit state)
+      if T.null $ T.strip contents
+        then continue state
+        else do
+        liftIO $ writeBChan clientChan contents
+        continue newState
 
     -- resetEdit :: AppState -> Editor Text ResourceName
-    resetEdit st = applyEdit transformer $ state ^. asCurrentEditorText
-    -- transformer :: TextZipper String -> TextZipper String
-    transformer _ = textZipper [] (Just 2)
+    resetEdit st = applyEdit transformer $ state ^. asMessageEditor
+    -- transformer :: TextZipper Text -> TextZipper Text
+    transformer _ = textZipper [] (Just 1)
 
-theApp :: App AppState WIEvent ResourceName
-theApp = App { appDraw = drawUI
-             , appHandleEvent = handleEvent
-             , appStartEvent = return
-             , appAttrMap = const $ attrMap defAttr []
-             , appChooseCursor = showFirstCursor
-             }
+mkApp :: BChan Text -> App AppState WIEvent ResourceName
+mkApp clientChan =
+  App { appDraw = drawUI
+      , appHandleEvent = handleEvent clientChan
+      , appStartEvent = return
+      , appAttrMap = const $ attrMap defAttr []
+      , appChooseCursor = showFirstCursor
+      }
 
--- send
-runUI :: IO ()
-runUI = do
-  let initialState = AppState [] [] (editor "edit-box" (Just 2) "")
-  chan <- newBChan 100
-
-  void $ forkIO $ forever $ do
-    -- t1 <- T.pack . show <$> getCurrentTime
-    -- writeBChan chan (WIENewClientMsg $ "new client message " <> t1)
-    -- threadDelay $ 1 * 10 ^ 6
-    t2 <- T.pack . show <$> getCurrentTime
-    writeBChan chan (WIENewServerMsg $ "new server message " <> t2)
-    threadDelay $ 3 * 10 ^ 6
-
-  let buildVty = Vty.mkVty Vty.defaultConfig
+runUI :: BChan WIEvent -> BChan Text -> IO ()
+runUI brickChan clientChan = do
+  let initialState = AppState [] [] (editor "edit-box" (Just 1) "")
+      buildVty = Vty.mkVty Vty.defaultConfig
   initialVty <- buildVty
-  void $ customMain initialVty buildVty (Just chan) theApp initialState
+  void $ customMain initialVty buildVty (Just brickChan) (mkApp clientChan) initialState
