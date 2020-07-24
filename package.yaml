@@ -27,14 +27,14 @@ dependencies:
 - brick
 - vty
 - websockets
-- unordered-containers # maybe not needed
+- wuss
 - time
-- random # maybe not needed
 - optparse-generic
 - microlens
 - microlens-th
 - text-zipper
 - vector
+- network-uri
 
 library:
   source-dirs: src
