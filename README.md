@@ -13,3 +13,7 @@ websocket-inspector --url ws://echo.websocket.org/
 ```shell
 websocket-inspector --url "wss://gateway.discord.gg/?v=6&encoding=json"
 ```
+
+### Screenshot
+
+![Screenshot of the tool](media/websocket-inspector-screenshot.png)
