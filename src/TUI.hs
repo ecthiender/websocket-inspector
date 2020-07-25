@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE TemplateHaskell   #-}
-module Lib
+module TUI
   ( runUI
   , WIEvent (..)
   , ConnectionStatus (..)
@@ -54,6 +54,7 @@ data AppState
   , _asServerMessages   :: !(BrickL.List ResourceName (UTCTime, Text))
   , _asMessageEditor    :: !(Editor Text ResourceName)
   , _asConnectionStatus :: !ConnectionStatus
+  , _asHistoryIndex     :: !(Maybe Int)
   } deriving (Show)
 
 makeLenses 'AppState
@@ -65,9 +66,9 @@ data WIEvent
   | WIEConnectionUpdate !ConnectionStatus
   deriving (Show)
 
-drawMessageBox :: Text -> AttrName -> BrickL.List ResourceName (UTCTime, Text) -> Widget ResourceName
-drawMessageBox label attrName msgs =
-  borderWithLabel (txt label) $ BrickL.renderList renderMsg False msgs
+drawMessageBox :: Widget ResourceName -> AttrName -> BrickL.List ResourceName (UTCTime, Text) -> Widget ResourceName
+drawMessageBox labelWidget attrName msgs =
+  borderWithLabel labelWidget $ BrickL.renderList renderMsg False msgs
   where
     -- TODO: strip message of escape sequence, tab and carriage return. see
     -- https://hackage.haskell.org/package/brick-0.55/docs/Brick-Widgets-Core.html#v:txt
@@ -78,9 +79,12 @@ drawMessageBox label attrName msgs =
       in "[" <> T.pack fmtTime <> "] "
 
 drawReadingBox :: AppState -> Widget ResourceName
-drawReadingBox (AppState clientMsgs serverMsgs _ _) =
-  center (drawMessageBox "Messages from Server" tsServer serverMsgs)
-  <+> center (drawMessageBox "Messages sent by you (client)" tsClient clientMsgs)
+drawReadingBox AppState{..} =
+  center (drawMessageBox serverLabel tsServer _asServerMessages)
+  <+> center (drawMessageBox clientLabel tsClient _asClientMessages)
+  where
+    serverLabel = withAttr serverBoxLabel $ txt "Messages from Server"
+    clientLabel = withAttr clientBoxLabel $ txt "Messages sent by you (client)"
 
 drawInputBox :: AppState -> Widget ResourceName
 drawInputBox state =
@@ -111,33 +115,40 @@ handleEvent :: BChan Text -> AppState -> BrickEvent ResourceName WIEvent -> Even
 handleEvent clientChan state@AppState{..} ev = case ev of
   -- handle custom events
   AppEvent aev -> case aev of
-    WIENewClientMsg m t -> let newList = insertNewMessage (t,m) _asClientMessages
+    WIENewClientMsg m t -> let newList = insertNewItem (t,m) _asClientMessages
                            in continue $ state { _asClientMessages = newList }
-    WIENewServerMsg m t -> let newList = insertNewMessage (t,m) _asServerMessages
+    WIENewServerMsg m t -> let newList = insertNewItem (t,m) _asServerMessages
                            in continue $ state { _asServerMessages = newList }
     WIEConnectionUpdate status -> continue $ state { _asConnectionStatus = status }
   -- handle Vty key events
   VtyEvent vev -> case vev of
     Vty.EvKey Vty.KEsc []   -> halt state
     Vty.EvKey Vty.KEnter [] -> handleEnter state clientChan
+    -- Vty.EvKey Vty.KUp []    -> handleHistorySearch state
     _                       -> handleEventLensed state asMessageEditor handleEditorEvent vev
                                >>= \st -> handleEventLensed st asClientMessages BrickL.handleListEvent vev
                                >>= \st -> handleEventLensed st asServerMessages BrickL.handleListEvent vev
                                >>= continue
   _            -> continue state
 
-insertNewMessage
-  :: a
-  -> BrickL.GenericList n Vec.Vector a
-  -> BrickL.GenericList n Vec.Vector a
-insertNewMessage elem msgList =
- let pos = Vec.length $ msgList ^. BrickL.listElementsL
- in BrickL.listMoveDown $ BrickL.listInsert pos elem msgList
+-- handleHistorySearch st@AppState{..} = do
+--   let lastIdx = (Vec.length $ _asClientMessages ^. BrickL.listElementsL) - 1
+--       idx = maybe lastIdx (\idx -> if idx <= 0 then idx else idx - 1) _asHistoryIndex
+--       messageAtIdx = (_asClientMessages ^. BrickL.listElementsL) Vec.! idx
+--       newEdit = applyEdit (const $ textZipper [snd messageAtIdx] (Just 1)) $ st ^. asMessageEditor
+--   continue $ st { _asHistoryIndex = Just idx, _asMessageEditor = newEdit }
+
+-- | inserts a new item to a 'BrickL.List', and moves the list down to the latest element
+insertNewItem :: a -> BrickL.List n a -> BrickL.List n a
+insertNewItem elem list =
+ let pos = Vec.length $ list ^. BrickL.listElementsL
+ in BrickL.listMoveDown $ BrickL.listInsert pos elem list
 
 handleEnter :: AppState -> BChan Text -> EventM n (Next AppState)
 handleEnter state clientChan = do
   let contents = T.unlines $ getEditContents $ state ^. asMessageEditor
       newState = state & asMessageEditor .~ (resetEdit state)
+                       & asHistoryIndex .~ Nothing -- reset the history index
   if T.null $ T.strip contents
     then continue state
     else do
@@ -158,31 +169,36 @@ mkApp clientChan =
       , appChooseCursor = showFirstCursor
       }
 
--- globalDefault :: Attr
--- globalDefault = white `on` black
-
 tsServer = "ts-server"
 tsClient = "ts-client"
 statusHud = "connection-status"
+serverBoxLabel = "server-box-label"
+clientBoxLabel = "client-box-label"
 
 styleMap :: AppState -> AttrMap
 styleMap state = attrMap defAttr
   [ (tsServer, fg blue)
   , (tsClient, fg green)
   , (statusHud, mkStatusHudStyle)
+  , (serverBoxLabel, fg cyan)
+  , (clientBoxLabel, fg green)
   ]
   where
+    -- globalDefault = white `on` black
     mkStatusHudStyle = case state ^. asConnectionStatus of
       CSConnecting -> fg yellow
       CSError _    -> fg red
       CSClosed     -> fg red
       CSConnected  -> fg green
 
+initialState :: AppState
+initialState =
+  let clientList = BrickL.list RNClientBox Vec.empty 1
+      serverList = BrickL.list RNServerBox Vec.empty 1
+  in AppState clientList serverList (editor RNMessageEditor (Just 1) "") CSConnecting Nothing
+
 runUI :: BChan WIEvent -> BChan Text -> IO ()
 runUI brickChan clientChan = do
-  let initialState = AppState clientList serverList (editor RNMessageEditor (Just 1) "") CSConnecting
-      clientList = BrickL.list RNClientBox Vec.empty 1
-      serverList = BrickL.list RNServerBox Vec.empty 1
-      buildVty = Vty.mkVty Vty.defaultConfig
+  let buildVty = Vty.mkVty Vty.defaultConfig
   initialVty <- buildVty
   void $ customMain initialVty buildVty (Just brickChan) (mkApp clientChan) initialState
