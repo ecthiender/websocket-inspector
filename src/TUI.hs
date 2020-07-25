@@ -1,6 +1,7 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards   #-}
-{-# LANGUAGE TemplateHaskell   #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell     #-}
 module TUI
   ( runUI
   , WIEvent (..)
@@ -17,14 +18,15 @@ import           Brick.Widgets.Border.Style
 import           Brick.Widgets.Center
 import           Brick.Widgets.Edit
 import           Control.Concurrent         (forkIO, threadDelay)
-import           Control.Monad              (forever, void)
+import           Control.Monad              (forever, void, when)
 import           Control.Monad.IO.Class
+import           Data.Maybe                 (fromMaybe)
 import           Data.Text                  (Text)
 import           Data.Text.Zipper
 import           Data.Time.Clock
 import           Data.Time.Format
-import           Graphics.Vty               (Attr, black, blue, cyan, green, red, white, withURL,
-                                             yellow)
+import           Graphics.Vty               (Attr, black, blue, cyan, green, red, rgbColor, white,
+                                             withURL, yellow)
 import           Graphics.Vty.Attributes    (defAttr)
 import           Lens.Micro
 import           Lens.Micro.TH
@@ -33,6 +35,8 @@ import qualified Brick.Widgets.List         as BrickL
 import qualified Data.Text                  as T
 import qualified Data.Vector                as Vec
 import qualified Graphics.Vty               as Vty
+
+grey = rgbColor 102 102 102
 
 data ResourceName
   = RNMessageEditor
@@ -66,6 +70,8 @@ data WIEvent
   | WIEConnectionUpdate !ConnectionStatus
   deriving (Show)
 
+data HistoryDir = HDUp | HDDown
+
 drawMessageBox :: Widget ResourceName -> AttrName -> BrickL.List ResourceName (UTCTime, Text) -> Widget ResourceName
 drawMessageBox labelWidget attrName msgs =
   borderWithLabel labelWidget $ BrickL.renderList renderMsg False msgs
@@ -75,7 +81,7 @@ drawMessageBox labelWidget attrName msgs =
     renderMsg _selected (time, msg) =
       withAttr attrName (txt "> ") <+> txtWrap (timestamp time <> msg)
     timestamp t =
-      let fmtTime = formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S" t
+      let fmtTime = formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S.%3q" t
       in "[" <> T.pack fmtTime <> "] "
 
 drawReadingBox :: AppState -> Widget ResourceName
@@ -84,11 +90,11 @@ drawReadingBox AppState{..} =
   <+> center (drawMessageBox clientLabel tsClient _asClientMessages)
   where
     serverLabel = withAttr serverBoxLabel $ txt "Messages from Server"
-    clientLabel = withAttr clientBoxLabel $ txt "Messages sent by you (client)"
+    clientLabel = withAttr clientBoxLabel $ txt "Messages sent"
 
 drawInputBox :: AppState -> Widget ResourceName
 drawInputBox state =
-  withBorderStyle unicode $ borderWithLabel (txt "Message Editor") $
+  withBorderStyle unicodeBold $ borderWithLabel (txt "Message Editor") $
   txt "> " <+> renderEditor (txt . T.unlines) True (state ^. asMessageEditor)
 
 drawStats :: AppState -> Widget ResourceName
@@ -105,44 +111,59 @@ drawBottomControl :: AppState -> Widget ResourceName
 drawBottomControl appState = drawInputBox appState <+> drawStats appState
 
 footerHelp :: Widget ResourceName
-footerHelp = txt "HELP: **ESC**: quit/exit | **ENTER**: Send message | Timestamps are in UTC."
+footerHelp = withAttr footerAttr $ txt "**ESC**: quit/exit | **ENTER**: Send message | **Up/Down**: Message History | Timestamps are in UTC."
 
 drawUI :: AppState -> [Widget ResourceName]
 drawUI appState =
   [drawReadingBox appState <=> drawBottomControl appState <=> footerHelp]
 
-handleEvent :: BChan Text -> AppState -> BrickEvent ResourceName WIEvent -> EventM ResourceName (Next AppState)
-handleEvent clientChan state@AppState{..} ev = case ev of
-  -- handle custom events
-  AppEvent aev -> case aev of
-    WIENewClientMsg m t -> let newList = insertNewItem (t,m) _asClientMessages
-                           in continue $ state { _asClientMessages = newList }
-    WIENewServerMsg m t -> let newList = insertNewItem (t,m) _asServerMessages
-                           in continue $ state { _asServerMessages = newList }
-    WIEConnectionUpdate status -> continue $ state { _asConnectionStatus = status }
-  -- handle Vty key events
-  VtyEvent vev -> case vev of
-    Vty.EvKey Vty.KEsc []   -> halt state
-    Vty.EvKey Vty.KEnter [] -> handleEnter state clientChan
-    -- Vty.EvKey Vty.KUp []    -> handleHistorySearch state
-    _                       -> handleEventLensed state asMessageEditor handleEditorEvent vev
-                               >>= \st -> handleEventLensed st asClientMessages BrickL.handleListEvent vev
-                               >>= \st -> handleEventLensed st asServerMessages BrickL.handleListEvent vev
-                               >>= continue
-  _            -> continue state
+handleEvent
+  :: BChan Text
+  -> AppState
+  -> BrickEvent ResourceName WIEvent
+  -> EventM ResourceName (Next AppState)
+handleEvent clientChan state@AppState{..} ev = do
+  vty <- getVtyHandle
+  let output = Vty.outputIface vty
+  when (Vty.supportsMode output Vty.BracketedPaste) $
+    liftIO $ Vty.setMode output Vty.BracketedPaste True
+  case ev of
+    -- handle custom events
+    AppEvent aev -> case aev of
+      WIENewClientMsg m t -> let newList = insertNewItem (t,m) _asClientMessages
+                            in continue $ state { _asClientMessages = newList }
+      WIENewServerMsg m t -> let newList = insertNewItem (t,m) _asServerMessages
+                            in continue $ state { _asServerMessages = newList }
+      WIEConnectionUpdate status -> continue $ state { _asConnectionStatus = status }
+    -- handle Vty key events
+    VtyEvent vev -> case vev of
+      Vty.EvKey Vty.KEsc []   -> halt state
+      Vty.EvKey (Vty.KChar 'q') [Vty.MCtrl]  -> halt state
+      Vty.EvKey Vty.KEnter [] -> handleEnter state clientChan
+      Vty.EvKey Vty.KUp []    -> handleHistorySearch state HDUp
+      Vty.EvKey Vty.KDown []  -> handleHistorySearch state HDDown
+      _                       -> handleEventLensed state asMessageEditor handleEditorEvent vev
+                                 >>= continue
+    _            -> continue state
 
--- handleHistorySearch st@AppState{..} = do
---   let lastIdx = (Vec.length $ _asClientMessages ^. BrickL.listElementsL) - 1
---       idx = maybe lastIdx (\idx -> if idx <= 0 then idx else idx - 1) _asHistoryIndex
---       messageAtIdx = (_asClientMessages ^. BrickL.listElementsL) Vec.! idx
---       newEdit = applyEdit (const $ textZipper [snd messageAtIdx] (Just 1)) $ st ^. asMessageEditor
---   continue $ st { _asHistoryIndex = Just idx, _asMessageEditor = newEdit }
+handleHistorySearch :: AppState -> HistoryDir -> EventM n (Next AppState)
+handleHistorySearch st@AppState{..} dir
+  | Vec.null (_asClientMessages ^. BrickL.listElementsL) = continue st
+  | otherwise = do
+  let list = _asClientMessages ^. BrickL.listElementsL
+      lastIdx = max 0 (Vec.length list - 1)
+      newIdx = case (_asHistoryIndex, dir) of
+        (Nothing, _)       -> lastIdx
+        (Just idx, HDUp)   -> max 0 (idx - 1)
+        (Just idx, HDDown) -> min lastIdx (idx + 1)
+      message = fromMaybe "" $ fmap snd $ list Vec.!? newIdx
+      newEdit = updateEditor _asMessageEditor [message]
 
--- | inserts a new item to a 'BrickL.List', and moves the list down to the latest element
-insertNewItem :: a -> BrickL.List n a -> BrickL.List n a
-insertNewItem elem list =
- let pos = Vec.length $ list ^. BrickL.listElementsL
- in BrickL.listMoveDown $ BrickL.listInsert pos elem list
+  continue $ st { _asHistoryIndex = Just newIdx, _asMessageEditor = newEdit }
+
+updateEditor :: Editor Text n -> [Text] -> Editor Text n
+updateEditor editor content =
+  applyEdit (const $ textZipper content (Just 1)) $ editor
 
 handleEnter :: AppState -> BChan Text -> EventM n (Next AppState)
 handleEnter state clientChan = do
@@ -155,10 +176,7 @@ handleEnter state clientChan = do
     liftIO $ writeBChan clientChan contents
     continue newState
   where
-    -- resetEdit :: AppState -> Editor Text ResourceName
-    resetEdit st = applyEdit transformer $ state ^. asMessageEditor
-    -- transformer :: TextZipper Text -> TextZipper Text
-    transformer _ = textZipper [] (Just 1)
+    resetEdit st = applyEdit clearZipper $ state ^. asMessageEditor
 
 mkApp :: BChan Text -> App AppState WIEvent ResourceName
 mkApp clientChan =
@@ -166,7 +184,7 @@ mkApp clientChan =
       , appHandleEvent = handleEvent clientChan
       , appStartEvent = return
       , appAttrMap = styleMap
-      , appChooseCursor = showFirstCursor
+      , appChooseCursor = const $ showCursorNamed RNMessageEditor
       }
 
 tsServer = "ts-server"
@@ -174,14 +192,16 @@ tsClient = "ts-client"
 statusHud = "connection-status"
 serverBoxLabel = "server-box-label"
 clientBoxLabel = "client-box-label"
+footerAttr = "footer"
 
 styleMap :: AppState -> AttrMap
 styleMap state = attrMap defAttr
   [ (tsServer, fg blue)
   , (tsClient, fg green)
   , (statusHud, mkStatusHudStyle)
-  , (serverBoxLabel, fg cyan)
+  , (serverBoxLabel, fg blue)
   , (clientBoxLabel, fg green)
+  , (footerAttr, fg grey)
   ]
   where
     -- globalDefault = white `on` black
@@ -202,3 +222,9 @@ runUI brickChan clientChan = do
   let buildVty = Vty.mkVty Vty.defaultConfig
   initialVty <- buildVty
   void $ customMain initialVty buildVty (Just brickChan) (mkApp clientChan) initialState
+
+-- | inserts a new item to a 'BrickL.List', and moves the list down to the latest element
+insertNewItem :: a -> BrickL.List n a -> BrickL.List n a
+insertNewItem elem list =
+ let pos = Vec.length $ list ^. BrickL.listElementsL
+ in BrickL.listMoveDown $ BrickL.listInsert pos elem list
