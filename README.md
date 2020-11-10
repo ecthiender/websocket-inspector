@@ -19,3 +19,11 @@ websocket-inspector --url "wss://gateway.discord.gg/?v=6&encoding=json"
 
 
 ![demo-gif](media/websocket-inspector-demo.GIF)
+
+### How to run it
+
+I have not worked on generating the binary on releases, so you would have to build it on your computer.
+
+- Clone the repo
+- Make sure you have [stack](https://docs.haskellstack.org/en/stable/README/) installed
+- `cd` into this directory and run `stack install`. This will copy the `websocket-inspector` binary into your `PATH`.
