@@ -11,7 +11,7 @@ module TUI
 import           Brick
 import           Brick.AttrMap              (AttrMap, attrMap)
 import           Brick.BChan
-import           Brick.Types                (handleEventLensed)
+import           Brick.Types                (zoom)
 import           Brick.Util                 (fg, on)
 import           Brick.Widgets.Border
 import           Brick.Widgets.Border.Style
@@ -29,6 +29,7 @@ import           Graphics.Vty               (Attr, black, blue, cyan, green, red
                                              withURL, yellow)
 import           Graphics.Vty.Attributes    (defAttr)
 import           Lens.Micro
+import           Lens.Micro.Mtl             ((.=))
 import           Lens.Micro.TH
 
 import qualified Brick.Widgets.List         as BrickL
@@ -119,36 +120,33 @@ drawUI appState =
 
 handleEvent
   :: BChan Text
-  -> AppState
   -> BrickEvent ResourceName WIEvent
-  -> EventM ResourceName (Next AppState)
-handleEvent clientChan state@AppState{..} ev = do
+  -> EventM ResourceName AppState ()
+handleEvent clientChan ev = do
   vty <- getVtyHandle
   let output = Vty.outputIface vty
   when (Vty.supportsMode output Vty.BracketedPaste) $
     liftIO $ Vty.setMode output Vty.BracketedPaste True
+  state@AppState{..} <- get
   case ev of
     -- handle custom events
     AppEvent aev -> case aev of
-      WIENewClientMsg m t -> let newList = insertNewItem (t,m) _asClientMessages
-                            in continue $ state { _asClientMessages = newList }
-      WIENewServerMsg m t -> let newList = insertNewItem (t,m) _asServerMessages
-                            in continue $ state { _asServerMessages = newList }
-      WIEConnectionUpdate status -> continue $ state { _asConnectionStatus = status }
+      WIENewClientMsg m t        -> asClientMessages .= insertNewItem (t,m) _asClientMessages
+      WIENewServerMsg m t        -> asServerMessages .= insertNewItem (t,m) _asServerMessages
+      WIEConnectionUpdate status -> asConnectionStatus .= status
     -- handle Vty key events
     VtyEvent vev -> case vev of
-      Vty.EvKey Vty.KEsc []   -> halt state
-      Vty.EvKey (Vty.KChar 'q') [Vty.MCtrl]  -> halt state
+      Vty.EvKey Vty.KEsc []   -> halt
+      Vty.EvKey (Vty.KChar 'q') [Vty.MCtrl]  -> halt
       Vty.EvKey Vty.KEnter [] -> handleEnter state clientChan
       Vty.EvKey Vty.KUp []    -> handleHistorySearch state HDUp
       Vty.EvKey Vty.KDown []  -> handleHistorySearch state HDDown
-      _                       -> handleEventLensed state asMessageEditor handleEditorEvent vev
-                                 >>= continue
-    _            -> continue state
+      _                       -> zoom asMessageEditor (handleEditorEvent ev) >>= \s -> modify id
+    _            -> modify id
 
-handleHistorySearch :: AppState -> HistoryDir -> EventM n (Next AppState)
+handleHistorySearch :: AppState -> HistoryDir -> EventM n AppState ()
 handleHistorySearch st@AppState{..} dir
-  | Vec.null (_asClientMessages ^. BrickL.listElementsL) = continue st
+  | Vec.null (_asClientMessages ^. BrickL.listElementsL) = modify id
   | otherwise = do
   let list = _asClientMessages ^. BrickL.listElementsL
       lastIdx = max 0 (Vec.length list - 1)
@@ -156,25 +154,25 @@ handleHistorySearch st@AppState{..} dir
         (Nothing, _)       -> lastIdx
         (Just idx, HDUp)   -> max 0 (idx - 1)
         (Just idx, HDDown) -> min lastIdx (idx + 1)
-      message = fromMaybe "" $ fmap snd $ list Vec.!? newIdx
+      message = maybe "" snd (list Vec.!? newIdx)
       newEdit = updateEditor _asMessageEditor [message]
 
-  continue $ st { _asHistoryIndex = Just newIdx, _asMessageEditor = newEdit }
+  modify $ const $ st { _asHistoryIndex = Just newIdx, _asMessageEditor = newEdit }
 
 updateEditor :: Editor Text n -> [Text] -> Editor Text n
 updateEditor editor content =
-  applyEdit (const $ textZipper content (Just 1)) $ editor
+  applyEdit (const $ textZipper content (Just 1)) editor
 
-handleEnter :: AppState -> BChan Text -> EventM n (Next AppState)
+handleEnter :: AppState -> BChan Text -> EventM n AppState ()
 handleEnter state clientChan = do
   let contents = T.unlines $ getEditContents $ state ^. asMessageEditor
-      newState = state & asMessageEditor .~ (resetEdit state)
+      newState = state & asMessageEditor .~ resetEdit state
                        & asHistoryIndex .~ Nothing -- reset the history index
   if T.null $ T.strip contents
-    then continue state
+    then modify id
     else do
     liftIO $ writeBChan clientChan contents
-    continue newState
+    modify $ const newState
   where
     resetEdit st = applyEdit clearZipper $ state ^. asMessageEditor
 
@@ -182,17 +180,17 @@ mkApp :: BChan Text -> App AppState WIEvent ResourceName
 mkApp clientChan =
   App { appDraw = drawUI
       , appHandleEvent = handleEvent clientChan
-      , appStartEvent = return
+      , appStartEvent = return ()
       , appAttrMap = styleMap
       , appChooseCursor = const $ showCursorNamed RNMessageEditor
       }
 
-tsServer = "ts-server"
-tsClient = "ts-client"
-statusHud = "connection-status"
-serverBoxLabel = "server-box-label"
-clientBoxLabel = "client-box-label"
-footerAttr = "footer"
+tsServer = attrName "ts-server"
+tsClient = attrName "ts-client"
+statusHud = attrName "connection-status"
+serverBoxLabel = attrName "server-box-label"
+clientBoxLabel = attrName "client-box-label"
+footerAttr = attrName "footer"
 
 styleMap :: AppState -> AttrMap
 styleMap state = attrMap defAttr

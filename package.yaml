@@ -31,6 +31,7 @@ dependencies:
 - time
 - optparse-generic
 - microlens
+- microlens-mtl
 - microlens-th
 - text-zipper
 - vector
